@@ -1,0 +1,111 @@
+name: Build firmware
+
+# Reassembles the RepRapFirmwareDebug workspace (rrf.sh + sibling repos) around
+# this checkout and runs the same Eclipse CDT headless build used locally.
+on:
+  push:
+    branches: [visionminer-3.5.4-debug]
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Build target (Eclipse config name)"
+        required: false
+        default: "Duet3_MB6HC"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  ECLIPSE_VERSION: "2026-06-R"
+  WS: ${{ github.workspace }}/ws
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check out RepRapFirmware (this push)
+        uses: actions/checkout@v4
+        with:
+          path: ws/repos/RepRapFirmware
+
+      - name: Check out RepRapFirmwareDebug (workspace manager)
+        uses: actions/checkout@v4
+        with:
+          repository: Remenod/RepRapFirmwareDebug
+          path: ws-debug-tools
+
+      - name: Install rrf.sh
+        run: |
+          cp ws-debug-tools/rrf.sh "$WS/rrf.sh"
+          chmod +x "$WS/rrf.sh"
+
+      - name: Set up Java (Eclipse requirement)
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up .NET 6 (CrcAppender requirement)
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "6.0.x"
+
+      - name: Install headless-GUI + SWT runtime deps
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y xvfb libxtst6 libxrender1
+
+      - name: Cache Eclipse CDT
+        id: cache-eclipse
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WS }}/eclipse-cpp
+          key: eclipse-cpp-${{ env.ECLIPSE_VERSION }}-linux-gtk-x86_64
+
+      - name: Download Eclipse CDT
+        if: steps.cache-eclipse.outputs.cache-hit != 'true'
+        run: |
+          mkdir -p "$WS/eclipse-cpp"
+          curl -fL --retry 3 -o /tmp/eclipse-cpp.tar.gz \
+            "https://download.eclipse.org/technology/epp/downloads/release/${ECLIPSE_VERSION%-R}/R/eclipse-cpp-${ECLIPSE_VERSION}-linux-gtk-x86_64.tar.gz"
+          tar -xf /tmp/eclipse-cpp.tar.gz -C "$WS/eclipse-cpp" --strip-components=1
+          rm -f /tmp/eclipse-cpp.tar.gz
+
+      - name: Add Eclipse to PATH
+        run: echo "$WS/eclipse-cpp" >> "$GITHUB_PATH"
+
+      - name: Cache ARM/Xtensa toolchains
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.WS }}/tools
+          key: rrf-toolchains-${{ hashFiles('ws-debug-tools/rrf.sh') }}
+
+      - name: Bootstrap workspace (toolchains, sibling repos, CrcAppender)
+        working-directory: ${{ env.WS }}
+        run: ./rrf.sh bootstrap
+
+      - name: Build
+        working-directory: ${{ env.WS }}
+        run: xvfb-run -a ./rrf.sh build "${{ inputs.target || 'Duet3_MB6HC' }}"
+
+      - name: Locate firmware binary
+        id: artifact
+        run: |
+          bin="$(find "$WS/repos/RepRapFirmware" -name '*.bin' -newer "$WS/rrf.sh" -print -quit)"
+          [ -n "$bin" ] || { echo "No .bin produced"; exit 1; }
+          echo "path=$bin" >> "$GITHUB_OUTPUT"
+          echo "sha_short=$(git -C "$WS/repos/RepRapFirmware" rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: debug-${{ steps.artifact.outputs.sha_short }}
+          name: Debug build ${{ steps.artifact.outputs.sha_short }}
+          target_commitish: ${{ github.sha }}
+          files: ${{ steps.artifact.outputs.path }}
